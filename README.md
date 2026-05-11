@@ -1,140 +1,103 @@
-# Allocator design study
-### Implicit vs Explicit Free List Design
+## Implementation Details
 
-## Overview
+### Block Layout
 
-This project implements and compares two heap memory allocator designs in C:
-- **Implicit free list allocator**
-- **Explicit free list allocator**
+Each heap block is stored inside a contiguous heap region and contains metadata used by the allocator to manage allocation and deallocation.
 
-The goal is to explore how different free-list strategies affect allocation efficiency, traversal cost, and memory utilization.
+An allocated block is organized as:
 
-The allocator simulates the behavior of `malloc` and `free` over a contiguous heap region, using low-level pointer arithmetic and custom metadata management.
+[ header | payload ]
 
----
+A free block is organized as:
 
-## Features
+[ header | payload / free-list pointers | footer ]
 
-- Contiguous heap memory simulation
-- Boundary-tag metadata (header/footer)
-- Block splitting during allocation
-- Immediate coalescing on free
-- Implicit free-list traversal
-- Explicit doubly linked free list
-- Trace-driven testing and benchmarking
+The header stores the block size and allocation status. Free blocks also use a footer so that the allocator can find the previous physical block during coalescing.
 
----
+The block size includes metadata and payload space. Since block sizes are aligned, the lowest bit of the size field can be used as the allocation bit.
 
-## Project Structure
-```text
-.
-├── src/
-│   ├── implicit_allocator.c
-│   ├── explicit_allocator.c
-│   └── heap_common.c
-├── include/
-│   └── allocator.h
-├── tests/
-│   ├── traces/
-│   └── benchmark.c
-├── docs/
-│   ├── design.md
-│   └── results.md
-├── Makefile
-└── README.md
-```
+### Header and Footer Encoding
 
----
+The allocator stores size and allocation status in a single metadata word.
 
-## Design Overview
+- The block size is extracted by masking out the allocation bit.
+- The allocation status is stored in the least significant bit.
+
+This keeps metadata compact while allowing the allocator to quickly determine whether a block is free or allocated.
+
+### Alignment
+
+All allocation requests are rounded up to satisfy alignment requirements. The allocator also adds metadata overhead before searching for a suitable free block.
+
+For example, a small user request may be expanded to include the header and any padding needed for alignment. This ensures that the returned payload pointer is properly aligned.
 
 ### Implicit Free List
 
-- Traverses the entire heap to find a suitable free block
-- Simpler implementation
-- Higher search overhead for large heaps
+The implicit free-list allocator does not store a separate list of free blocks. Instead, it traverses the heap block by block.
+
+During allocation, it:
+
+1. Starts at the beginning of the heap.
+2. Reads each block’s header.
+3. Checks whether the block is free and large enough.
+4. Moves to the next block using the current block’s size.
+
+This design is simple, but allocation can become slow because the allocator may need to scan many allocated blocks before finding a usable free block.
 
 ### Explicit Free List
 
-- Maintains a doubly linked list of free blocks
-- Traverses only free blocks during allocation
-- Faster allocation with additional metadata complexity
+The explicit free-list allocator maintains a doubly linked list of only free blocks. The `prev` and `next` pointers are stored inside the payload area of each free block.
 
----
+A free block in the explicit allocator has the following layout:
 
-## Allocation Strategy
+[ header | prev pointer | next pointer | remaining free space | footer ]
 
-- First-fit (baseline)
-- Optional extensions: next-fit, best-fit
+When a block is allocated, it is removed from the free list. When a block is freed, it is inserted back into the free list. This reduces traversal cost because allocation only searches free blocks instead of every block in the heap.
 
----
+The trade-off is that the explicit design requires more careful pointer management, especially during splitting and coalescing.
 
-## How It Works
+### Block Splitting
 
-### Allocation
+When the allocator finds a free block larger than the requested size, it may split the block.
 
-1. Search for a suitable free block
-2. Split the block if it is larger than required
-3. Mark allocated portion as used
+The first part is marked as allocated and returned to the user. The remaining part becomes a smaller free block.
 
-### Free
+The allocator only performs splitting if the remaining space is large enough to form a valid free block with its own metadata. This avoids creating unusable fragments.
 
-1. Mark block as free
-2. Check adjacent blocks
-3. Coalesce neighboring free blocks
+### Coalescing
 
----
+The allocator performs immediate coalescing when a block is freed. It checks the neighboring physical blocks and merges adjacent free blocks to reduce external fragmentation.
 
-## Benchmarking
+There are four cases:
 
-The project includes trace-driven tests to evaluate:
+1. Both neighbors are allocated: no coalescing is needed.
+2. The next block is free: merge with the next block.
+3. The previous block is free: merge with the previous block.
+4. Both neighbors are free: merge all three blocks.
 
-- Allocation throughput
-- Number of blocks traversed
-- Heap utilization
-- Fragmentation behavior
+Boundary tags make this efficient because the footer of the previous block stores its size, allowing the allocator to locate the previous block without scanning from the beginning of the heap.
 
----
+### Free List Updates
 
-## Key Insights
+For the explicit allocator, the free list must be updated whenever a block changes state.
 
-- Implicit free lists are simple but scale poorly with heap size
-- Explicit free lists significantly reduce traversal cost
-- Trade-off between implementation complexity and runtime performance
+- Allocated blocks are removed from the free list.
+- Freed blocks are inserted into the free list.
+- Coalesced neighboring blocks are removed before the merged block is inserted.
+- Split remainders are inserted back as free blocks.
 
----
+Incorrect free-list updates can cause corrupted pointers, cycles in the free list, or invalid memory accesses, so this part required careful debugging.
 
-## Skills Demonstrated
+### Debugging and Testing
 
-- Systems programming in C
-- Manual memory management
-- Pointer arithmetic
-- Data structure design (linked lists)
-- Debugging with GDB
-- Performance analysis
+The allocator was tested using trace-driven workloads that simulate repeated calls to allocation and free operations.
 
----
+During development, GDB was used to inspect heap layout, verify header and footer values, and debug corrupted free-list pointers.
 
-## Future Improvements
+Common issues encountered included:
 
-- Realloc support
-- Segregated free lists
-- Best-fit / next-fit comparison
-- Heap consistency checker
-- Performance visualization
-
----
-
-## Why This Project Matters
-
-This project reflects core concepts used in:
-
-- Operating systems
-- Game engines
-- Memory allocators (e.g., malloc implementations)
-- Performance-critical systems
-
----
-
-## Author
-Joy Tao
+- incorrect block-size calculations after alignment
+- forgetting to update footers after splitting
+- failing to remove blocks from the explicit free list before coalescing
+- returning a pointer to the block header instead of the payload
+- creating free blocks that were too small to hold required metadata
